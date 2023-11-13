@@ -252,9 +252,9 @@ public final class SequentialRestRateLimiter implements RestRateLimiter
         return System.currentTimeMillis();
     }
 
-    private void updateBucket(Route.CompiledRoute route, Response response)
+    private Bucket updateBucket(Route.CompiledRoute route, Response response)
     {
-        MiscUtil.locked(lock, () ->
+        return MiscUtil.locked(lock, () ->
         {
             try
             {
@@ -302,7 +302,7 @@ public final class SequentialRestRateLimiter implements RestRateLimiter
                         boolean firstHit = hitRatelimit.add(baseRoute) && retryAfter < 60000;
                         // Update the bucket to the new information
                         bucket.remaining = 0;
-                        bucket.reset = getNow() + retryAfter;
+                        bucket.reset = now + retryAfter;
                         // don't log warning if we hit the rate limit for the first time, likely due to initialization of the bucket
                         // unless its a long retry-after delay (more than a minute)
                         if (firstHit)
@@ -310,6 +310,8 @@ public final class SequentialRestRateLimiter implements RestRateLimiter
                         else
                             log.warn("Encountered 429 on route {} with bucket {} Retry-After: {} ms Scope: {}", baseRoute, bucket.bucketId, retryAfter, scope);
                     }
+
+                    log.trace("Updated bucket {} to retry after {}", bucket.bucketId, bucket.reset - now);
                     return bucket;
                 }
 
@@ -445,7 +447,17 @@ public final class SequentialRestRateLimiter implements RestRateLimiter
             {
                 Response response = request.execute();
                 if (response != null)
-                    updateBucket(request.getRoute(), response);
+                {
+                    Bucket newBucket = updateBucket(request.getRoute(), response);
+                    if (newBucket != this && !request.isDone())
+                    {
+                        log.debug("Moving request to new bucket {} -> {}", this, newBucket);
+                        newBucket.enqueue(request);
+                        runBucket(newBucket);
+                        return false;
+                    }
+                }
+
                 if (!request.isDone())
                     retry(request);
             }
